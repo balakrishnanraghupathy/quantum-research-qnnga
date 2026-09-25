@@ -26,16 +26,22 @@ reproduction of the paper's exact tuning — treat reported metrics as
 illustrative, not guaranteed.
 
 Install requirements:
-    pip install pennylane numpy scikit-learn
+    pip install qiskit==1.2.2 qiskit-aer==0.15.1 qiskit-machine-learning==0.7.2 numpy==1.26.4 scikit-learn==1.7.2
 """
 
 import time
 import numpy as np
 from importlib.util import spec_from_file_location, module_from_spec
-
-import pennylane as qml
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+# Qiskit Core & Aer
+from qiskit import QuantumCircuit
+from qiskit.circuit import ParameterVector
+from qiskit.quantum_info import SparsePauliOp
+from qiskit_aer.primitives import Estimator as AerEstimator
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+
+# Load preprocessing module
 _spec = spec_from_file_location("data_preprocessing", "1_data_preprocessing.py")
 prep = module_from_spec(_spec)
 _spec.loader.exec_module(prep)
@@ -43,27 +49,20 @@ _spec.loader.exec_module(prep)
 RANDOM_STATE = 42
 rng = np.random.default_rng(RANDOM_STATE)
 
-N_QUBITS = 8          # target number of selected features (paper: 8 of 14)
+N_QUBITS = 8           # target number of selected features
 PQNN_LAYERS = 3        # variational circuit depth
 QGA_POP = 10
 QGA_GENERATIONS = 6
-REDUNDANCY_WEIGHT = 0.15  # penalty strength for correlated/overlapping features
+REDUNDANCY_WEIGHT = 0.15
 
 
 # ---------------------------------------------------------------------
-# 1. Quantum-state overlap (fidelity) between two angle-encoded features
+# 1. Quantum-state overlap (fidelity) between angle-encoded features
 # ---------------------------------------------------------------------
 def feature_state_overlap(col_a, col_b):
-    """
-    Angle-encode each feature column onto a single qubit: |psi> =
-    cos(theta/2)|0> + sin(theta/2)|1>, theta scaled from the feature's
-    mean value in [0, pi]. Returns the fidelity |<psi_a|psi_b>|^2 as a
-    proxy for redundancy between two features (1 = identical, 0 = orthogonal).
-    """
     theta_a = np.pi * (np.mean(col_a) - col_a.min()) / (col_a.max() - col_a.min() + 1e-9)
     theta_b = np.pi * (np.mean(col_b) - col_b.min()) / (col_b.max() - col_b.min() + 1e-9)
-    overlap = np.cos((theta_a - theta_b) / 2) ** 2
-    return overlap
+    return np.cos((theta_a - theta_b) / 2) ** 2
 
 
 def redundancy_penalty(mask, X):
@@ -75,74 +74,93 @@ def redundancy_penalty(mask, X):
         for j in range(i + 1, len(cols)):
             total += feature_state_overlap(X[:, cols[i]], X[:, cols[j]])
             count += 1
-    return total / count  # average pairwise overlap
+    return total / count
 
 
 # ---------------------------------------------------------------------
-# 2. Parameterized Quantum Neural Network (PQNN) classifier
+# 2. Parameterized Quantum Neural Network (PQNN) in Qiskit
 # ---------------------------------------------------------------------
-def build_pqnn(n_qubits):
-    dev = qml.device("default.qubit", wires=n_qubits)
+def build_pqnn_circuit(n_qubits):
+    inputs = ParameterVector("x", n_qubits)
+    weights = ParameterVector("w", PQNN_LAYERS * n_qubits * 2)
 
-    @qml.qnode(dev)
-    def circuit(inputs, weights):
-        # Angle encoding of the (scaled) selected features
+    qc = QuantumCircuit(n_qubits)
+
+    # Angle encoding of inputs
+    for i in range(n_qubits):
+        qc.ry(inputs[i], i)
+
+    # Variational layers: RY, RZ, and circular CNOT entanglement
+    w_idx = 0
+    for layer in range(PQNN_LAYERS):
         for i in range(n_qubits):
-            qml.RY(inputs[i], wires=i)
-        # Variational layers: RY/RZ rotations + ring of CNOT entanglers
-        for layer in range(PQNN_LAYERS):
-            for i in range(n_qubits):
-                qml.RY(weights[layer, i, 0], wires=i)
-                qml.RZ(weights[layer, i, 1], wires=i)
-            for i in range(n_qubits):
-                qml.CNOT(wires=[i, (i + 1) % n_qubits])
-        return qml.expval(qml.PauliZ(0))
+            qc.ry(weights[w_idx], i)
+            qc.rz(weights[w_idx + 1], i)
+            w_idx += 2
+        for i in range(n_qubits):
+            qc.cx(i, (i + 1) % n_qubits)
 
-    return circuit
+    # Observable: Pauli-Z on qubit 0 (represented as string "II...IZ")
+    observable_str = "I" * (n_qubits - 1) + "Z"
+    observable = SparsePauliOp.from_list([(observable_str, 1.0)])
+
+    # Exact Aer Statevector Estimator (shot-free)
+    estimator = AerEstimator(run_options={"shots": None, "seed": RANDOM_STATE})
+
+    qnn = EstimatorQNN(
+        circuit=qc,
+        observables=[observable],
+        input_params=inputs,
+        weight_params=weights,
+        estimator=estimator,
+    )
+
+    return qnn, len(weights)
 
 
 def scale_to_angles(X):
-    """Min-max scale each column to [0, pi] for angle encoding."""
     X_min, X_max = X.min(axis=0), X.max(axis=0)
     return np.pi * (X - X_min) / (X_max - X_min + 1e-9), (X_min, X_max)
 
 
-def pqnn_forward(circuit, weights, X_angles):
-    outputs = np.array([circuit(row, weights) for row in X_angles])
-    # Map PauliZ expectation in [-1, 1] -> probability in [0, 1]
-    return (outputs + 1) / 2
+def pqnn_forward(qnn, weights, X_angles):
+    outputs = qnn.forward(X_angles, weights).flatten()
+    return (outputs + 1) / 2  # Map expectation [-1, 1] -> [0, 1]
 
 
 def train_pqnn(X_train, y_train, n_qubits, epochs=40, lr=0.15):
-    weights = 0.1 * rng.standard_normal((PQNN_LAYERS, n_qubits, 2))
-    circuit = build_pqnn(n_qubits)
+    qnn, num_weights = build_pqnn_circuit(n_qubits)
+    weights = 0.1 * rng.standard_normal(num_weights)
     X_angles, _ = scale_to_angles(X_train)
-    y_signed = 2 * y_train - 1  # map {0,1} -> {-1,+1} to match PauliZ range
+    y_signed = (2 * y_train - 1).reshape(-1, 1)  # Targets in {-1, +1}
 
-    def cost(w):
-        preds = np.array([circuit(row, w) for row in X_angles])
-        return np.mean((preds - y_signed) ** 2)
-
-    opt = qml.GradientDescentOptimizer(stepsize=lr)
+    # Batch Gradient Descent via Qiskit's Estimator backward pass
     for epoch in range(epochs):
-        weights = opt.step(cost, weights)
-        if (epoch + 1) % 10 == 0:
-            print(f"  PQNN epoch {epoch+1}/{epochs}  loss={cost(weights):.4f}")
+        preds = qnn.forward(X_angles, weights)  # Shape (N, 1)
+        _, grad_weights = qnn.backward(X_angles, weights)  # Shape (N, 1, num_weights)
 
-    return circuit, weights
+        # MSE gradient: d/dw [ (1/N) * sum((pred - y)^2) ] = (2/N) * sum((pred - y) * dpred/dw)
+        error = preds - y_signed
+        grad = np.mean(2 * error[:, :, None] * grad_weights, axis=0).flatten()
+
+        weights -= lr * grad
+
+        if (epoch + 1) % 10 == 0:
+            loss = np.mean((preds - y_signed) ** 2)
+            print(f"  PQNN epoch {epoch+1}/{epochs}  loss={loss:.4f}")
+
+    return qnn, weights
 
 
 # ---------------------------------------------------------------------
 # 3. Quantum Genetic Algorithm (QGA) for feature selection
 # ---------------------------------------------------------------------
 def measure_qubits(thetas):
-    """Collapse each qubit chromosome to a bit via its Born-rule probability."""
     probs_1 = np.sin(thetas) ** 2
     return (rng.random(thetas.shape) < probs_1).astype(int)
 
 
 def enforce_cardinality(mask, target_k):
-    """Keep exactly target_k selected features (paper selects a fixed subset size)."""
     ones = np.where(mask == 1)[0]
     if len(ones) > target_k:
         drop = rng.choice(ones, size=len(ones) - target_k, replace=False)
@@ -156,9 +174,9 @@ def enforce_cardinality(mask, target_k):
 
 def qga_fitness(mask, X_train, X_test, y_train, y_test, n_qubits):
     cols = np.where(mask == 1)[0]
-    circuit, weights = train_pqnn(X_train[:, cols], y_train, n_qubits, epochs=20)
+    qnn, weights = train_pqnn(X_train[:, cols], y_train, n_qubits, epochs=20)
     X_angles, _ = scale_to_angles(X_test[:, cols])
-    probs = pqnn_forward(circuit, weights, X_angles)
+    probs = pqnn_forward(qnn, weights, X_angles)
     preds = (probs > 0.5).astype(int)
     acc = accuracy_score(y_test, preds)
     penalty = redundancy_penalty(mask, X_train)
@@ -167,7 +185,6 @@ def qga_fitness(mask, X_train, X_test, y_train, y_test, n_qubits):
 
 
 def quantum_genetic_algorithm(X_train, X_test, y_train, y_test, n_features, target_k=N_QUBITS):
-    # Each individual = vector of qubit rotation angles theta in [0, pi/2]
     population = rng.uniform(np.pi / 8, 3 * np.pi / 8, size=(QGA_POP, n_features))
     best_mask, best_fit, best_acc = None, -1.0, 0.0
 
@@ -186,15 +203,12 @@ def quantum_genetic_algorithm(X_train, X_test, y_train, y_test, n_features, targ
 
         print(f"QGA Gen {gen+1}/{QGA_GENERATIONS}  best_fitness={fits.max():.4f}  best_acc={accs.max():.4f}")
 
-        # Quantum rotation gate update: nudge every individual's angles
-        # toward the best individual found so far (exploration + exploitation)
-        target_theta = np.pi / 2 * best_mask  # push toward 1 (theta=pi/2) or 0
+        target_theta = np.pi / 2 * best_mask
         rotation_step = 0.05 * np.pi
         direction = np.sign(target_theta - population)
         population = population + rotation_step * direction
         population = np.clip(population, 0.01, np.pi / 2 - 0.01)
 
-        # Small mutation for diversity
         mutate = rng.random(population.shape) < 0.05
         population[mutate] = rng.uniform(np.pi / 8, 3 * np.pi / 8, size=mutate.sum())
 
@@ -202,7 +216,7 @@ def quantum_genetic_algorithm(X_train, X_test, y_train, y_test, n_features, targ
 
 
 # ---------------------------------------------------------------------
-# 4. Three-tier risk stratification
+# 4. Three-tier risk stratification & main routine
 # ---------------------------------------------------------------------
 def risk_tier(prob, low_cut=0.33, high_cut=0.66):
     if prob < low_cut:
@@ -212,9 +226,6 @@ def risk_tier(prob, low_cut=0.33, high_cut=0.66):
     return "High"
 
 
-# ---------------------------------------------------------------------
-# 5. End-to-end run
-# ---------------------------------------------------------------------
 def run_qnnga(local_path: str = None):
     X_train, X_test, y_train, y_test, feature_names, _ = prep.load_data(local_path)
     n_features = X_train.shape[1]
@@ -229,9 +240,9 @@ def run_qnnga(local_path: str = None):
     cols = np.where(best_mask == 1)[0]
     print("\nTraining final PQNN classifier on selected subset...")
     start = time.time()
-    circuit, weights = train_pqnn(X_train[:, cols], y_train, len(cols), epochs=60)
+    qnn, weights = train_pqnn(X_train[:, cols], y_train, len(cols), epochs=60)
     X_test_angles, _ = scale_to_angles(X_test[:, cols])
-    probs = pqnn_forward(circuit, weights, X_test_angles)
+    probs = pqnn_forward(qnn, weights, X_test_angles)
     latency = time.time() - start
 
     preds = (probs > 0.5).astype(int)
